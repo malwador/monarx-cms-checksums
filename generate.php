@@ -69,8 +69,16 @@ const CMS_DEFS = [
     'joomla' => [
         'label'          => 'Joomla',
         'archive_type'   => 'zip',
-        // Tag on GitHub may or may not use a 'v' prefix; handled in download_url()
+        // Primary: resolved via GitHub API (browser_download_url bypasses redirects)
+        // Fallback 1: official downloads.joomla.org
+        // Fallback 2: direct GitHub releases URL
         'download_url'   => 'https://github.com/joomla/joomla-cms/releases/download/{version}/Joomla_{version}-Stable-Full_Package.zip',
+        'github_repo'    => 'joomla/joomla-cms',
+        'asset_pattern'  => 'Joomla_{version}-Stable-Full_Package.zip',
+        'download_fallbacks' => [
+            // downloads.joomla.org uses dashed version in path: 5.4.5 → joomla5/5-4-5/
+            'https://downloads.joomla.org/cms/joomla{major}/{version_dashed}/Joomla_{version}-Stable-Full_Package.zip',
+        ],
         'strip_prefix'   => '',
         'version_source' => 'github:joomla/joomla-cms',
         'stable_filter'  => '/^\d+\.\d+\.\d+$/',
@@ -89,12 +97,25 @@ const CMS_DEFS = [
     'prestashop' => [
         'label'          => 'PrestaShop',
         'archive_type'   => 'zip',
-        // The outer zip contains an inner prestashop.zip — handled specially
+        // Primary: resolved via GitHub API (browser_download_url bypasses redirects)
+        // Fallback: GitHub source archive (PS 9.x stopped attaching zip assets to releases)
         'download_url'   => 'https://github.com/PrestaShop/PrestaShop/releases/download/{version}/prestashop_{version}.zip',
+        'github_repo'    => 'PrestaShop/PrestaShop',
+        'asset_pattern'  => 'prestashop_{version}.zip',
+        // Fallback entries can override archive_type, strip_prefix, nested_zip for that specific URL
+        'download_fallbacks' => [
+            [
+                'url'          => 'https://github.com/PrestaShop/PrestaShop/archive/refs/tags/{version}.tar.gz',
+                'archive_type' => 'tar.gz',
+                'strip_prefix' => 'PrestaShop-{version}/',
+                'nested_zip'   => '',   // no nested zip for source archive
+                'label'        => 'GitHub source archive',
+            ],
+        ],
         'strip_prefix'   => '',
         'version_source' => 'github:PrestaShop/PrestaShop',
         'stable_filter'  => '/^\d+\.\d+\.\d+$/',
-        'nested_zip'     => 'prestashop.zip',   // extract this inner zip after download
+        'nested_zip'     => 'prestashop.zip',   // extract this inner zip after download (PS 8.x packaged releases)
         'exclude'        => [
             'app/config/parameters.php',
             'app/config/parameters_test.php',
@@ -303,20 +324,184 @@ function fetch_versions_github(string $repo, int $n, string $stable_filter, stri
 //  PROCESS ONE VERSION
 // ══════════════════════════════════════════════════════════════════════════════
 
+/**
+ * Resolve the best available download URL for a CMS version.
+ *
+ * Strategy (in order):
+ *   1. GitHub API → find the release asset whose name matches asset_pattern
+ *      and return its browser_download_url (direct CDN, no redirect issues).
+ *   2. download_fallbacks[] — additional URLs to try (supports plain strings
+ *      or arrays with 'url' + optional archive_type/strip_prefix/nested_zip overrides).
+ *   3. The configured download_url as a last resort.
+ *
+ * Returns an array:
+ *   url          - the selected download URL
+ *   archive_type - overridden archive type (or the def's default)
+ *   strip_prefix - overridden strip prefix (or the def's default)
+ *   nested_zip   - overridden nested zip name (or the def's default)
+ */
+function get_archive_url(array $def, string $ver, string $token): array
+{
+    $candidates = [];
+
+    // 1. GitHub API asset resolution
+    if (!empty($def['github_repo']) && !empty($def['asset_pattern'])) {
+        $api_url = resolve_github_asset_url(
+            $def['github_repo'],
+            $ver,
+            $def['asset_pattern'],
+            $token
+        );
+        if ($api_url) {
+            $candidates[] = ['url' => $api_url, 'label' => 'GitHub API (CDN)'];
+        }
+    }
+
+    // 2. Configured fallback entries (plain string URL or array with overrides)
+    foreach ($def['download_fallbacks'] ?? [] as $fb) {
+        if (is_string($fb)) {
+            $fb_url = resolve_url_extended($fb, $ver);
+            $candidates[] = ['url' => $fb_url, 'label' => 'fallback: ' . (parse_url($fb_url, PHP_URL_HOST) ?: $fb_url)];
+        } else {
+            // Structured fallback: ['url'=>..., 'archive_type'=>..., 'strip_prefix'=>..., 'nested_zip'=>..., 'label'=>...]
+            $fb_url = resolve_url_extended($fb['url'], $ver);
+            $entry  = ['url' => $fb_url, 'label' => $fb['label'] ?? ('fallback: ' . (parse_url($fb_url, PHP_URL_HOST) ?: $fb_url))];
+            if (isset($fb['archive_type'])) $entry['archive_type'] = $fb['archive_type'];
+            if (isset($fb['strip_prefix']))  $entry['strip_prefix'] = resolve_url_extended($fb['strip_prefix'], $ver);
+            if (array_key_exists('nested_zip', $fb)) $entry['nested_zip'] = $fb['nested_zip'];
+            $candidates[] = $entry;
+        }
+    }
+
+    // 3. Original configured URL
+    $direct = resolve_url($def['download_url'], $ver);
+    $candidates[] = ['url' => $direct, 'label' => 'direct URL'];
+
+    // Try each candidate with a HEAD request; use first that is reachable
+    foreach ($candidates as $c) {
+        log_info("    ↳ Trying {$c['label']}: {$c['url']}");
+        if (url_is_reachable($c['url'], $token)) {
+            log_info("      ✓ Reachable");
+            return [
+                'url'          => $c['url'],
+                'archive_type' => $c['archive_type'] ?? $def['archive_type'],
+                'strip_prefix' => $c['strip_prefix'] ?? str_replace('{version}', $ver, $def['strip_prefix']),
+                'nested_zip'   => array_key_exists('nested_zip', $c) ? $c['nested_zip'] : ($def['nested_zip'] ?? ''),
+            ];
+        }
+        log_warn("      ✗ Not reachable, trying next...");
+    }
+
+    // All candidates failed HEAD check — attempt direct URL anyway and let
+    // download_file() surface the real error
+    log_warn("    All URL candidates failed reachability check; will attempt direct URL anyway");
+    return [
+        'url'          => $direct,
+        'archive_type' => $def['archive_type'],
+        'strip_prefix' => str_replace('{version}', $ver, $def['strip_prefix']),
+        'nested_zip'   => $def['nested_zip'] ?? '',
+    ];
+}
+
+/**
+ * Call the GitHub Releases API for a specific tag and find the asset
+ * whose name matches the given pattern (supports {version} placeholder).
+ * Returns the browser_download_url (direct CDN link) or empty string on failure.
+ */
+function resolve_github_asset_url(string $repo, string $ver, string $pattern, string $token): string
+{
+    $asset_name = str_replace('{version}', $ver, $pattern);
+
+    // GitHub tags may have a 'v' prefix — try both
+    foreach ([$ver, 'v' . $ver] as $tag) {
+        $api_url = "https://api.github.com/repos/{$repo}/releases/tags/{$tag}";
+        $headers = ['User-Agent: MonarX-Checksum-Generator'];
+        if ($token) $headers[] = "Authorization: Bearer $token";
+
+        $body = http_get($api_url, $headers);
+        if (!$body) continue;
+
+        $release = json_decode($body, true);
+        if (!is_array($release) || empty($release['assets'])) continue;
+
+        foreach ($release['assets'] as $asset) {
+            if (($asset['name'] ?? '') === $asset_name) {
+                $cdn_url = $asset['browser_download_url'] ?? '';
+                if ($cdn_url) {
+                    log_info("      GitHub API: found asset '{$asset_name}' → {$cdn_url}");
+                    return $cdn_url;
+                }
+            }
+        }
+
+        log_warn("      GitHub API: asset '{$asset_name}' not found in release {$tag}");
+    }
+    return '';
+}
+
+/**
+ * Check whether a URL returns HTTP 200 via a HEAD request (or GET if HEAD fails).
+ * Used to pick the best candidate before committing to a full download.
+ */
+function url_is_reachable(string $url, string $token = ''): bool
+{
+    if (!function_exists('curl_init')) {
+        // No cURL — skip pre-check, assume reachable
+        return true;
+    }
+    $ch = curl_init($url);
+    $headers = ['User-Agent: MonarX-Checksum-Generator/1.0'];
+    if ($token && str_contains($url, 'github.com')) {
+        $headers[] = "Authorization: Bearer $token";
+    }
+    curl_setopt_array($ch, [
+        CURLOPT_NOBODY         => true,   // HEAD request
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => 15,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_HTTPHEADER     => $headers,
+    ]);
+    curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    return $code === 200;
+}
+
+/**
+ * Extended URL resolver — supports {version}, {major}, {version_dashed} placeholders.
+ *   {major}          → major version digit (e.g. "5" from "5.4.5")
+ *   {version_dashed} → version with dots replaced by dashes (e.g. "5-4-5")
+ */
+function resolve_url_extended(string $url, string $version): string
+{
+    $parts    = explode('.', $version);
+    $major    = $parts[0] ?? '0';
+    $dashed   = str_replace('.', '-', $version);
+    return str_replace(
+        ['{version}', '{major}', '{version_dashed}'],
+        [$version,    $major,    $dashed],
+        $url
+    );
+}
+
 function process_version(string $cms, array $def, string $ver, string $tmpdir, string $token): void
 {
     $label = $def['label'];
     log_info("  Processing {$label} {$ver}...");
 
-    // Resolve download URL (replace {version} and {strip_prefix} placeholders)
-    $url   = resolve_url($def['download_url'], $ver);
-    $strip = str_replace('{version}', $ver, $def['strip_prefix']);
+    // Resolve download URL — try GitHub API asset URL first, then fallbacks, then configured URL
+    // Returns array with url + possible overrides for archive_type, strip_prefix, nested_zip
+    $resolved     = get_archive_url($def, $ver, $token);
+    $url          = $resolved['url'];
+    $archive_type = $resolved['archive_type'];
+    $strip        = $resolved['strip_prefix'];
+    $nested_zip   = $resolved['nested_zip'];
 
     // Create temp workspace
     $workspace = $tmpdir . '/mv_ck_' . $cms . '_' . preg_replace('/[^a-z0-9\.\-]/', '_', $ver);
     @mkdir($workspace, 0755, true);
 
-    $archive = $workspace . '/archive.' . ($def['archive_type'] === 'tar.gz' ? 'tar.gz' : 'zip');
+    $archive = $workspace . '/archive.' . ($archive_type === 'tar.gz' ? 'tar.gz' : 'zip');
 
     // Download
     log_info("    ↓ Downloading $url");
@@ -333,19 +518,19 @@ function process_version(string $cms, array $def, string $ver, string $tmpdir, s
     @mkdir($extract_dir, 0755, true);
 
     $ok = false;
-    if ($def['archive_type'] === 'tar.gz') {
+    if ($archive_type === 'tar.gz') {
         $ok = extract_targz($archive, $extract_dir);
     } else {
-        // Handle PrestaShop's double-zip: outer zip → inner prestashop.zip → actual files
-        if (!empty($def['nested_zip'])) {
+        // Handle double-zip packages (e.g. PrestaShop 8.x: outer zip → inner prestashop.zip → actual files)
+        if ($nested_zip !== '') {
             $outer_dir = $workspace . '/outer';
             @mkdir($outer_dir, 0755, true);
             if (extract_zip($archive, $outer_dir)) {
-                $inner = $outer_dir . '/' . $def['nested_zip'];
+                $inner = $outer_dir . '/' . $nested_zip;
                 if (file_exists($inner)) {
                     $ok = extract_zip($inner, $extract_dir);
                 } else {
-                    log_warn("    ✗ Expected nested zip '{$def['nested_zip']}' not found inside outer archive");
+                    log_warn("    ✗ Expected nested zip '{$nested_zip}' not found inside outer archive");
                 }
                 rmdir_recursive($outer_dir);
             }
