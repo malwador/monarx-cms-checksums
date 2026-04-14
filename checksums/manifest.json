@@ -1,0 +1,12 @@
+{
+    "updated": "2026-04-14T18:09:56Z",
+    "cms": {
+        "drupal": {
+            "label": "Drupal",
+            "versions": [
+                "11.3.6"
+            ],
+            "latest": "11.3.6"
+        }
+    }
+}
